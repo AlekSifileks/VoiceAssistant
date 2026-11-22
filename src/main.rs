@@ -1,15 +1,18 @@
-//! Набросок приёма голоса.
+//! Приём фразы и локальное распознавание.
 //!
-//! Слышит микрофон, закрывает фразу по тишине и пишет её в wav.
-//! Распознавания и отправки текста нет. Граница модуля — `docs/modules/audio-capture.md`.
+//! Микрофон режет речь на фразы, Whisper печатает текст в терминал.
+//! Сеть не открывается. Модули: `docs/modules/audio-capture.md`, `docs/modules/stt.md`.
 
 mod capture;
+mod stt;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use capture::{CaptureError, Config, Event};
+use stt::{Engine, SttError};
 
 fn main() {
     if let Err(err) = run() {
@@ -18,7 +21,7 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), CaptureError> {
+fn run() -> Result<(), AppError> {
     let args = match parse_args() {
         Ok(args) => args,
         Err(message) => {
@@ -40,7 +43,22 @@ fn run() -> Result<(), CaptureError> {
         return Ok(());
     }
 
-    std::fs::create_dir_all(&args.out).map_err(|err| CaptureError::Device(err.to_string()))?;
+    let started = Instant::now();
+    let mut engine = Engine::load(&args.model, args.language.as_deref())?;
+    println!(
+        "модель {} загружена за {:.1} с, язык: {}",
+        args.model.display(),
+        started.elapsed().as_secs_f32(),
+        engine.language_label()
+    );
+
+    if let Some(path) = args.file {
+        let samples = read_wav(&path)?;
+        print_transcript(&mut engine, &samples)?;
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&args.out).map_err(|err| AppError::Message(err.to_string()))?;
 
     let running = Arc::new(AtomicBool::new(true));
     let flag = Arc::clone(&running);
@@ -83,6 +101,9 @@ fn run() -> Result<(), CaptureError> {
                 ),
                 Err(err) => eprintln!("не записал {}: {err}", path.display()),
             }
+            if let Err(err) = print_transcript(&mut engine, &phrase.samples) {
+                eprintln!("{err}");
+            }
         }
     })?;
 
@@ -95,6 +116,9 @@ struct Args {
     out: PathBuf,
     threshold: f32,
     silence_ms: u32,
+    model: PathBuf,
+    language: Option<String>,
+    file: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -103,6 +127,9 @@ fn parse_args() -> Result<Args, String> {
         out: PathBuf::from("captures"),
         threshold: Config::default().threshold,
         silence_ms: Config::default().silence_ms,
+        model: PathBuf::from(stt::DEFAULT_MODEL),
+        language: None,
+        file: None,
     };
     let mut tokens = std::env::args().skip(1);
     while let Some(token) = tokens.next() {
@@ -133,6 +160,15 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--silence-ms должен быть больше нуля".into());
                 }
             }
+            "--model" => {
+                args.model = PathBuf::from(next_value(&mut tokens, "--model")?);
+            }
+            "--language" => {
+                args.language = Some(next_value(&mut tokens, "--language")?);
+            }
+            "--file" => {
+                args.file = Some(PathBuf::from(next_value(&mut tokens, "--file")?));
+            }
             other => return Err(format!("неизвестный аргумент: {other}\n{}", usage())),
         }
     }
@@ -151,16 +187,89 @@ fn print_usage() {
 
 fn usage() -> &'static str {
     "\
-voice-assistant — слушает микрофон и пишет фразы в wav. Никуда не отправляет.
+voice-assistant — слушает микрофон, пишет wav и печатает текст. Никуда не отправляет.
 
   cargo run --
   cargo run -- --probe
-  cargo run -- --threshold 0.02 --silence-ms 800 --out captures
+  cargo run -- --file captures/phrase-001.wav
+  cargo run -- --language ru
 
-  --probe           секунда с микрофона и уровень, без записи
+  --probe           секунда с микрофона и уровень, без модели и без записи
+  --file PATH       распознать готовый wav 16 кГц моно и выйти
+  --model PATH      файл ggml (по умолчанию models/ggml-large-v3-turbo.bin)
+  --language CODE   язык речи, например ru или en; по умолчанию авто
   --out DIR         куда писать phrase-NNN.wav (по умолчанию captures)
   --threshold N     уровень, с которого кадр считается речью (по умолчанию 0.02)
   --silence-ms N    пауза, которая закрывает фразу (по умолчанию 700)"
+}
+
+fn print_transcript(engine: &mut Engine, samples: &[f32]) -> Result<(), SttError> {
+    match engine.transcribe(samples)? {
+        Some(transcript) => println!(
+            "текст ({} мс): {}",
+            transcript.elapsed.as_millis(),
+            transcript.text
+        ),
+        None => println!("текста нет"),
+    }
+    Ok(())
+}
+
+fn read_wav(path: &Path) -> Result<Vec<f32>, AppError> {
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|err| AppError::Message(format!("{}: {err}", path.display())))?;
+    let spec = reader.spec();
+    if spec.channels != 1 || spec.sample_rate != 16_000 {
+        return Err(AppError::Message(format!(
+            "{}: нужен моно 16 кГц, в файле {} кан. и {} Гц",
+            path.display(),
+            spec.channels,
+            spec.sample_rate
+        )));
+    }
+    let samples = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| AppError::Message(err.to_string()))?,
+        hound::SampleFormat::Int => {
+            let scale = (1i64 << (spec.bits_per_sample.saturating_sub(1))) as f32;
+            reader
+                .samples::<i32>()
+                .map(|sample| sample.map(|value| value as f32 / scale))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| AppError::Message(err.to_string()))?
+        }
+    };
+    Ok(samples)
+}
+
+enum AppError {
+    Capture(CaptureError),
+    Stt(SttError),
+    Message(String),
+}
+
+impl std::fmt::Display for AppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Capture(err) => write!(f, "{err}"),
+            Self::Stt(err) => write!(f, "{err}"),
+            Self::Message(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl From<CaptureError> for AppError {
+    fn from(err: CaptureError) -> Self {
+        Self::Capture(err)
+    }
+}
+
+impl From<SttError> for AppError {
+    fn from(err: SttError) -> Self {
+        Self::Stt(err)
+    }
 }
 
 fn write_wav(path: &std::path::Path, phrase: &capture::Phrase) -> Result<(), hound::Error> {

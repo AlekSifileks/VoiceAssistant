@@ -10,3 +10,4 @@ publish = false
 cpal = "0.15"
 ctrlc = "3.4"
 hound = "3.5"
+whisper-rs = { version = "0.16", features = ["metal"] }
