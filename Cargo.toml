@@ -1,0 +1,12 @@
+[package]
+name = "voice-assistant"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Локальный голосовой помощник. Сейчас принимает речь и режет её на фразы."
+publish = false
+
+[dependencies]
+cpal = "0.15"
+ctrlc = "3.4"
+hound = "3.5"
