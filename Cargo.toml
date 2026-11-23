@@ -3,11 +3,12 @@ name = "voice-assistant"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "Локальный голосовой помощник. Сейчас принимает речь и режет её на фразы."
+description = "Локальный голосовой помощник. Слышит фразу и выполняет команды по обращению."
 publish = false
 
 [dependencies]
 cpal = "0.15"
 ctrlc = "3.4"
 hound = "3.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
 whisper-rs = { version = "0.16", features = ["metal"] }

@@ -1,4 +1,6 @@
 /target
 /captures
 /models
+/data
+.env
 /plan

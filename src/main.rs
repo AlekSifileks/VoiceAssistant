@@ -1,9 +1,10 @@
-//! Приём фразы и локальное распознавание.
+//! Приём фразы, распознавание и команды по обращению.
 //!
-//! Микрофон режет речь на фразы, Whisper печатает текст в терминал.
-//! Сеть не открывается. Модули: `docs/modules/audio-capture.md`, `docs/modules/stt.md`.
+//! Микрофон режет речь, Whisper печатает текст. «Эни пуск …» открывает приложение.
+//! Сеть помощника не открывается. Модули: `docs/modules/`.
 
 mod capture;
+mod commands;
 mod stt;
 
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use capture::{CaptureError, Config, Event};
+use commands::{Outcome, Settings};
 use stt::{Engine, SttError};
 
 fn main() {
@@ -43,6 +45,17 @@ fn run() -> Result<(), AppError> {
         return Ok(());
     }
 
+    let commands = Settings::from_env();
+    if commands.enabled {
+        println!(
+            "команды включены, обращение «{}», закладки {}",
+            commands.address(),
+            commands.database.display()
+        );
+    } else {
+        println!("команды выключены");
+    }
+
     let started = Instant::now();
     let mut engine = Engine::load(&args.model, args.language.as_deref())?;
     println!(
@@ -54,7 +67,9 @@ fn run() -> Result<(), AppError> {
 
     if let Some(path) = args.file {
         let samples = read_wav(&path)?;
-        print_transcript(&mut engine, &samples)?;
+        if let Some(text) = recognize(&mut engine, &samples)? {
+            report_command(commands::handle(&text, &commands));
+        }
         return Ok(());
     }
 
@@ -101,8 +116,10 @@ fn run() -> Result<(), AppError> {
                 ),
                 Err(err) => eprintln!("не записал {}: {err}", path.display()),
             }
-            if let Err(err) = print_transcript(&mut engine, &phrase.samples) {
-                eprintln!("{err}");
+            match recognize(&mut engine, &phrase.samples) {
+                Ok(Some(text)) => report_command(commands::handle(&text, &commands)),
+                Ok(None) => {}
+                Err(err) => eprintln!("{err}"),
             }
         }
     })?;
@@ -203,16 +220,29 @@ voice-assistant — слушает микрофон, пишет wav и печа�
   --silence-ms N    пауза, которая закрывает фразу (по умолчанию 700)"
 }
 
-fn print_transcript(engine: &mut Engine, samples: &[f32]) -> Result<(), SttError> {
+fn recognize(engine: &mut Engine, samples: &[f32]) -> Result<Option<String>, SttError> {
     match engine.transcribe(samples)? {
-        Some(transcript) => println!(
-            "текст ({} мс): {}",
-            transcript.elapsed.as_millis(),
-            transcript.text
-        ),
-        None => println!("текста нет"),
+        Some(transcript) => {
+            println!(
+                "текст ({} мс): {}",
+                transcript.elapsed.as_millis(),
+                transcript.text
+            );
+            Ok(Some(transcript.text))
+        }
+        None => {
+            println!("текста нет");
+            Ok(None)
+        }
     }
-    Ok(())
+}
+
+fn report_command(outcome: Outcome) {
+    match outcome {
+        Outcome::Ignored => {}
+        Outcome::Done(message) => println!("команда: {message}"),
+        Outcome::Failed(message) => eprintln!("команда: {message}"),
+    }
 }
 
 fn read_wav(path: &Path) -> Result<Vec<f32>, AppError> {
