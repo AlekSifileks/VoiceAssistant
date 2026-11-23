@@ -46,15 +46,19 @@ fn run() -> Result<(), AppError> {
     }
 
     let commands = Settings::from_env();
-    if commands.enabled {
+    let catalog = if commands.enabled {
+        let catalog = commands::load(&commands).map_err(AppError::Message)?;
         println!(
-            "команды включены, обращение «{}», закладки {}",
+            "команды включены, обращение «{}», {} фраз, база {}",
             commands.address(),
+            catalog.len(),
             commands.database.display()
         );
+        catalog
     } else {
         println!("команды выключены");
-    }
+        commands::Catalog::empty()
+    };
 
     let started = Instant::now();
     let mut engine = Engine::load(&args.model, args.language.as_deref())?;
@@ -68,7 +72,7 @@ fn run() -> Result<(), AppError> {
     if let Some(path) = args.file {
         let samples = read_wav(&path)?;
         if let Some(text) = recognize(&mut engine, &samples)? {
-            report_command(commands::handle(&text, &commands));
+            report_command(commands::handle(&text, &commands, &catalog));
         }
         return Ok(());
     }
@@ -117,7 +121,7 @@ fn run() -> Result<(), AppError> {
                 Err(err) => eprintln!("не записал {}: {err}", path.display()),
             }
             match recognize(&mut engine, &phrase.samples) {
-                Ok(Some(text)) => report_command(commands::handle(&text, &commands)),
+                Ok(Some(text)) => report_command(commands::handle(&text, &commands, &catalog)),
                 Ok(None) => {}
                 Err(err) => eprintln!("{err}"),
             }
