@@ -7,6 +7,7 @@ mod capture;
 mod chat;
 mod commands;
 mod stt;
+mod tts;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,6 +77,16 @@ fn run() -> Result<(), AppError> {
     if chat_config.api_key.trim().is_empty() {
         println!("чат: ключа OpenRouter нет, «поболтаем» сообщит об этом");
     }
+    let tts_config = tts::Config::from_env();
+    println!(
+        "озвучка: чат через {}, подтверждение голосом {}",
+        tts_config.provider, tts_config.ack_voice
+    );
+    println!("загружаю голос…");
+    let mut speaker = tts::Speaker::start(tts_config);
+    if speaker.reply_ready() {
+        println!("голос чата готов");
+    }
 
     let started = Instant::now();
     let mut engine = Engine::load(&args.model, args.language.as_deref())?;
@@ -90,7 +101,15 @@ fn run() -> Result<(), AppError> {
     if let Some(path) = args.file {
         let samples = read_wav(&path)?;
         if let Some(text) = recognize(&mut engine, &samples)? {
-            dispatch(&text, &commands, &catalog, &chat_config, &chat_models, &mut dialogue);
+            dispatch(
+                &text,
+                &commands,
+                &catalog,
+                &chat_config,
+                &chat_models,
+                &mut dialogue,
+                &mut speaker,
+            );
         }
         return Ok(());
     }
@@ -146,6 +165,7 @@ fn run() -> Result<(), AppError> {
                     &chat_config,
                     &chat_models,
                     &mut dialogue,
+                    &mut speaker,
                 ),
                 Ok(None) => {}
                 Err(err) => eprintln!("{err}"),
@@ -273,17 +293,27 @@ fn dispatch(
     chat_config: &chat::Config,
     models: &[chat::ChatModel],
     dialogue: &mut Dialogue,
+    voice: &mut tts::Speaker,
 ) {
     match commands::handle(text, settings, catalog) {
         Outcome::Ignored => {}
-        other => {
-            report_command(other);
+        Outcome::Done(message) => {
+            println!("команда: {message}");
+            voice.acknowledge(true);
+            return;
+        }
+        Outcome::Failed(message) => {
+            eprintln!("команда: {message}");
+            voice.acknowledge(false);
             return;
         }
     }
     match chat::take(text, &settings.name, &settings.wake, models, dialogue) {
         chat::Turn::Quiet => {}
-        chat::Turn::Notice(message) => println!("чат: {message}"),
+        chat::Turn::Notice(message) => {
+            println!("чат: {message}");
+            voice.say(&message);
+        }
         chat::Turn::Ask {
             model_id,
             messages,
@@ -292,17 +322,13 @@ fn dispatch(
             Ok(reply) => {
                 dialogue.remember(&user, &reply);
                 println!("{}: {reply}", chat::speaker(&settings.name));
+                voice.say(&reply);
             }
-            Err(err) => eprintln!("чат: {err}"),
+            Err(err) => {
+                eprintln!("чат: {err}");
+                voice.say(&err);
+            }
         },
-    }
-}
-
-fn report_command(outcome: Outcome) {
-    match outcome {
-        Outcome::Ignored => {}
-        Outcome::Done(message) => println!("команда: {message}"),
-        Outcome::Failed(message) => eprintln!("команда: {message}"),
     }
 }
 

@@ -167,6 +167,9 @@ pub fn run(
 
         for phrase in phrases {
             on_event(Event::Phrase(phrase));
+            // Пока фразу распознают и озвучивают, микрофон слышит колонки.
+            // Эти кадры не распознаём: иначе ответ помощника уйдёт обратно в чат.
+            while input.rx.try_recv().is_ok() {}
         }
 
         if !speaking && last_level.elapsed() >= Duration::from_secs(1) {

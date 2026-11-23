@@ -338,17 +338,7 @@ fn read_models(connection: &Connection) -> Result<Vec<ChatModel>, String> {
 }
 
 fn post_openrouter(config: &Config, model_id: &str, messages: &[Message]) -> Result<String, String> {
-    let payload = serde_json::json!({
-        "model": model_id,
-        "messages": messages
-            .iter()
-            .map(|message| serde_json::json!({
-                "role": message.role,
-                "content": message.content,
-            }))
-            .collect::<Vec<_>>(),
-        "max_tokens": 400,
-    });
+    let payload = chat_request(model_id, messages);
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(45))
         .build();
@@ -374,6 +364,26 @@ fn post_openrouter(config: &Config, model_id: &str, messages: &[Message]) -> Res
         }
         Err(err) => Err(format!("нет связи с OpenRouter: {err}")),
     }
+}
+
+fn chat_request(model_id: &str, messages: &[Message]) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "model": model_id,
+        "messages": messages
+            .iter()
+            .map(|message| serde_json::json!({
+                "role": message.role,
+                "content": message.content,
+            }))
+            .collect::<Vec<_>>(),
+        // Лимит общий для скрытого рассуждения и видимой фразы.
+        // 400 токенов Gemini тратила на рассуждение и обрывала слово.
+        "max_tokens": 2048,
+    });
+    if model_id.starts_with("google/") {
+        payload["reasoning"] = serde_json::json!({ "effort": "low" });
+    }
+    payload
 }
 
 fn read_reply(body: &str) -> Result<String, String> {
@@ -576,6 +586,16 @@ mod tests {
             complete(&openrouter, Task::Chat, "google/gemini-3.8-flash", &[]).unwrap_err(),
             "нет ключа OpenRouter"
         );
+    }
+
+    #[test]
+    fn gemini_keeps_a_short_reply_inside_a_larger_token_budget() {
+        let request = chat_request("google/gemini-3.8-flash", &[]);
+        assert_eq!(request["max_tokens"], 2048);
+        assert_eq!(request["reasoning"]["effort"], "low");
+        let other = chat_request("anthropic/claude-sonnet-5.5", &[]);
+        assert_eq!(other["max_tokens"], 2048);
+        assert!(other.get("reasoning").is_none());
     }
 
     #[test]

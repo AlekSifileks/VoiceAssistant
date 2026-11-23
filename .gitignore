@@ -1,6 +1,7 @@
 /target
 /captures
 /models
+/tts/.venv
 /data
 .env
 /plan
