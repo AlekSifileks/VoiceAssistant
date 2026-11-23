@@ -143,13 +143,27 @@ fn interpret(text: &str, settings: &Settings, catalog: &Catalog) -> Request {
 }
 
 fn after_address<'a>(spoken: &'a str, name: &str, wake: &str) -> Option<&'a str> {
-    let prefix = format!("{name} {wake}");
-    if spoken == prefix {
-        return Some("");
+    let wake = normalize(wake);
+    name_forms(name).into_iter().find_map(|form| {
+        let prefix = format!("{form} {wake}");
+        if spoken == prefix {
+            return Some("");
+        }
+        spoken
+            .strip_prefix(&format!("{prefix} "))
+            .map(str::trim_start)
+    })
+}
+
+pub(crate) fn name_forms(name: &str) -> Vec<String> {
+    let name = normalize(name);
+    if name == "эни" || name == "энни" {
+        vec!["эни".into(), "энни".into()]
+    } else if name.is_empty() {
+        Vec::new()
+    } else {
+        vec![name]
     }
-    spoken
-        .strip_prefix(&format!("{prefix} "))
-        .map(str::trim_start)
 }
 
 fn launch_app(label: &str, app: &str) -> Outcome {
@@ -355,7 +369,7 @@ fn is_http_url(url: &str) -> bool {
     lower.starts_with("https://") || lower.starts_with("http://")
 }
 
-fn normalize(text: &str) -> String {
+pub(crate) fn normalize(text: &str) -> String {
     let mut out = String::new();
     let mut spaced = false;
     for ch in text.chars() {
@@ -454,6 +468,10 @@ mod tests {
         );
         assert!(matches!(
             interpret("Эни пуск курсор пожалуйста", &settings, &catalog),
+            Request::OpenApp { app, .. } if app == "Cursor"
+        ));
+        assert!(matches!(
+            interpret("Энни пуск курсор", &settings, &catalog),
             Request::OpenApp { app, .. } if app == "Cursor"
         ));
         let _ = std::fs::remove_file(&settings.database);

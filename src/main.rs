@@ -1,9 +1,10 @@
-//! Приём фразы, распознавание и команды по обращению.
+//! Приём фразы, распознавание, команды и голосовой чат.
 //!
-//! Микрофон режет речь, Whisper печатает текст. «Эни пуск …» открывает приложение.
-//! Сеть помощника не открывается. Модули: `docs/modules/`.
+//! Микрофон режет речь, Whisper печатает текст. «Энни пуск …» открывает приложение.
+//! «Энни, поболтаем» начинает разговор через OpenRouter. Модули: `docs/modules/`.
 
 mod capture;
+mod chat;
 mod commands;
 mod stt;
 
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use capture::{CaptureError, Config, Event};
+use chat::Dialogue;
 use commands::{Outcome, Settings};
 use stt::{Engine, SttError};
 
@@ -59,6 +61,21 @@ fn run() -> Result<(), AppError> {
         println!("команды выключены");
         commands::Catalog::empty()
     };
+    let chat_config = chat::Config::from_env();
+    let chat_models = chat::load_models(&commands.database).map_err(AppError::Message)?;
+    let default_model = chat_models
+        .iter()
+        .find(|model| model.is_default)
+        .map(|model| model.label.as_str())
+        .unwrap_or("нет");
+    println!(
+        "чат: {} моделей, по умолчанию «{default_model}», поставщик {}",
+        chat_models.len(),
+        chat_config.provider
+    );
+    if chat_config.api_key.trim().is_empty() {
+        println!("чат: ключа OpenRouter нет, «поболтаем» сообщит об этом");
+    }
 
     let started = Instant::now();
     let mut engine = Engine::load(&args.model, args.language.as_deref())?;
@@ -69,10 +86,11 @@ fn run() -> Result<(), AppError> {
         engine.language_label()
     );
 
+    let mut dialogue = Dialogue::new();
     if let Some(path) = args.file {
         let samples = read_wav(&path)?;
         if let Some(text) = recognize(&mut engine, &samples)? {
-            report_command(commands::handle(&text, &commands, &catalog));
+            dispatch(&text, &commands, &catalog, &chat_config, &chat_models, &mut dialogue);
         }
         return Ok(());
     }
@@ -121,7 +139,14 @@ fn run() -> Result<(), AppError> {
                 Err(err) => eprintln!("не записал {}: {err}", path.display()),
             }
             match recognize(&mut engine, &phrase.samples) {
-                Ok(Some(text)) => report_command(commands::handle(&text, &commands, &catalog)),
+                Ok(Some(text)) => dispatch(
+                    &text,
+                    &commands,
+                    &catalog,
+                    &chat_config,
+                    &chat_models,
+                    &mut dialogue,
+                ),
                 Ok(None) => {}
                 Err(err) => eprintln!("{err}"),
             }
@@ -208,7 +233,7 @@ fn print_usage() {
 
 fn usage() -> &'static str {
     "\
-voice-assistant — слушает микрофон, пишет wav и печатает текст. Никуда не отправляет.
+voice-assistant — слушает микрофон, печатает текст и выполняет команды. Чат после «поболтаем» идёт в OpenRouter.
 
   cargo run --
   cargo run -- --probe
@@ -238,6 +263,38 @@ fn recognize(engine: &mut Engine, samples: &[f32]) -> Result<Option<String>, Stt
             println!("текста нет");
             Ok(None)
         }
+    }
+}
+
+fn dispatch(
+    text: &str,
+    settings: &Settings,
+    catalog: &commands::Catalog,
+    chat_config: &chat::Config,
+    models: &[chat::ChatModel],
+    dialogue: &mut Dialogue,
+) {
+    match commands::handle(text, settings, catalog) {
+        Outcome::Ignored => {}
+        other => {
+            report_command(other);
+            return;
+        }
+    }
+    match chat::take(text, &settings.name, &settings.wake, models, dialogue) {
+        chat::Turn::Quiet => {}
+        chat::Turn::Notice(message) => println!("чат: {message}"),
+        chat::Turn::Ask {
+            model_id,
+            messages,
+            user,
+        } => match chat::complete(chat_config, chat::Task::Chat, &model_id, &messages) {
+            Ok(reply) => {
+                dialogue.remember(&user, &reply);
+                println!("{}: {reply}", chat::speaker(&settings.name));
+            }
+            Err(err) => eprintln!("чат: {err}"),
+        },
     }
 }
 
