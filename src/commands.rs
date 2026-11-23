@@ -90,6 +90,11 @@ pub fn load(settings: &Settings) -> Result<Catalog, String> {
     load_commands(&connection)
 }
 
+pub fn is_addressed(text: &str, settings: &Settings) -> bool {
+    let spoken = normalize(text);
+    after_address(&spoken, &settings.name, &settings.wake).is_some()
+}
+
 pub fn handle(text: &str, settings: &Settings, catalog: &Catalog) -> Outcome {
     if !settings.enabled {
         return Outcome::Ignored;
@@ -252,6 +257,16 @@ fn load_commands(connection: &Connection) -> Result<Catalog, String> {
     Ok(Catalog { commands })
 }
 
+pub(crate) fn tune_connection(connection: &Connection) -> Result<(), String> {
+    connection
+        .busy_timeout(std::time::Duration::from_secs(3))
+        .map_err(|err| err.to_string())?;
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 fn prepare_database(path: &Path, legacy: Option<&Path>) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -260,6 +275,7 @@ fn prepare_database(path: &Path, legacy: Option<&Path>) -> Result<Connection, St
     }
     let fresh = !path.exists();
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    tune_connection(&connection)?;
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS commands (
@@ -474,6 +490,8 @@ mod tests {
             interpret("Энни пуск курсор", &settings, &catalog),
             Request::OpenApp { app, .. } if app == "Cursor"
         ));
+        assert!(is_addressed("Энни, пуск курсор", &settings));
+        assert!(!is_addressed("просто речь", &settings));
         let _ = std::fs::remove_file(&settings.database);
     }
 
@@ -528,6 +546,10 @@ mod tests {
         connection.execute("DELETE FROM bookmarks", []).unwrap();
         drop(connection);
         let connection = prepare_database(&settings.database, None).unwrap();
+        let mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
         let catalog = load_commands(&connection).unwrap();
         assert_eq!(catalog.len(), 0);
         assert_eq!(find_bookmark(&settings.database, "Тимбенч").unwrap(), None);

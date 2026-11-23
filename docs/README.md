@@ -28,6 +28,8 @@ Phrase → stt → текст
 | Голосовой чат | [modules/chat.md](modules/chat.md) | набросок, «поболтаем» ведёт разговор через OpenRouter |
 | Озвучка | [modules/tts.md](modules/tts.md) | набросок, чат говорит Qwen3, команда говорит «Готово» |
 
+Окно на Mac — `app/`. Оно запускает этот же бинарник и правит `data/assistant.db`. Сборка: `app/build.sh`.
+
 ## Шаблон файла модуля
 
 1. Статус.

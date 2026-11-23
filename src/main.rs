@@ -49,7 +49,8 @@ fn run() -> Result<(), AppError> {
     }
 
     let commands = Settings::from_env();
-    let catalog = if commands.enabled {
+    emit(&serde_json::json!({"тип": "состояние", "значение": "загрузка"}));
+    let mut catalog = if commands.enabled {
         let catalog = commands::load(&commands).map_err(AppError::Message)?;
         println!(
             "команды включены, обращение «{}», {} фраз, база {}",
@@ -104,7 +105,7 @@ fn run() -> Result<(), AppError> {
             dispatch(
                 &text,
                 &commands,
-                &catalog,
+                &mut catalog,
                 &chat_config,
                 &chat_models,
                 &mut dialogue,
@@ -133,6 +134,7 @@ fn run() -> Result<(), AppError> {
         config.silence_ms,
         args.out.display()
     );
+    emit(&serde_json::json!({"тип": "состояние", "значение": "слушаю"}));
 
     let mut index = 0u32;
     let out_dir = args.out;
@@ -142,7 +144,10 @@ fn run() -> Result<(), AppError> {
             info.name, info.sample_rate, info.channels
         ),
         Event::Listening { rms } => println!("тишина, уровень {rms:.4}"),
-        Event::SpeechStarted => println!("слышу речь…"),
+        Event::SpeechStarted => {
+            println!("слышу речь…");
+            emit(&serde_json::json!({"тип": "состояние", "значение": "речь"}));
+        }
         Event::Phrase(phrase) => {
             index += 1;
             let path = out_dir.join(format!("phrase-{index:03}.wav"));
@@ -161,7 +166,7 @@ fn run() -> Result<(), AppError> {
                 Ok(Some(text)) => dispatch(
                     &text,
                     &commands,
-                    &catalog,
+                    &mut catalog,
                     &chat_config,
                     &chat_models,
                     &mut dialogue,
@@ -170,9 +175,11 @@ fn run() -> Result<(), AppError> {
                 Ok(None) => {}
                 Err(err) => eprintln!("{err}"),
             }
+            emit(&serde_json::json!({"тип": "состояние", "значение": "слушаю"}));
         }
     })?;
 
+    emit(&serde_json::json!({"тип": "состояние", "значение": "остановлен"}));
     println!("остановлено");
     Ok(())
 }
@@ -277,6 +284,7 @@ fn recognize(engine: &mut Engine, samples: &[f32]) -> Result<Option<String>, Stt
                 transcript.elapsed.as_millis(),
                 transcript.text
             );
+            emit(&serde_json::json!({"тип": "фраза", "текст": transcript.text}));
             Ok(Some(transcript.text))
         }
         None => {
@@ -289,21 +297,29 @@ fn recognize(engine: &mut Engine, samples: &[f32]) -> Result<Option<String>, Stt
 fn dispatch(
     text: &str,
     settings: &Settings,
-    catalog: &commands::Catalog,
+    catalog: &mut commands::Catalog,
     chat_config: &chat::Config,
     models: &[chat::ChatModel],
     dialogue: &mut Dialogue,
     voice: &mut tts::Speaker,
 ) {
+    if commands::is_addressed(text, settings) {
+        match commands::load(settings) {
+            Ok(fresh) => *catalog = fresh,
+            Err(err) => eprintln!("команды: {err}"),
+        }
+    }
     match commands::handle(text, settings, catalog) {
         Outcome::Ignored => {}
         Outcome::Done(message) => {
             println!("команда: {message}");
+            emit(&serde_json::json!({"тип": "команда", "успех": true, "текст": message}));
             voice.acknowledge(true);
             return;
         }
         Outcome::Failed(message) => {
             eprintln!("команда: {message}");
+            emit(&serde_json::json!({"тип": "команда", "успех": false, "текст": message}));
             voice.acknowledge(false);
             return;
         }
@@ -330,6 +346,10 @@ fn dispatch(
             }
         },
     }
+}
+
+fn emit(payload: &serde_json::Value) {
+    println!("событие {payload}");
 }
 
 fn read_wav(path: &Path) -> Result<Vec<f32>, AppError> {

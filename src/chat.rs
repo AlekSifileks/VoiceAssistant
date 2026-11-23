@@ -125,6 +125,7 @@ pub fn load_models(path: &Path) -> Result<Vec<ChatModel>, String> {
         }
     }
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    crate::commands::tune_connection(&connection)?;
     let existed: bool = connection
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chat_models'",

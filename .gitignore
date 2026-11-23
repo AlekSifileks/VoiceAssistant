@@ -2,6 +2,7 @@
 /captures
 /models
 /tts/.venv
+/app/Voice Assistant.app
 /data
 .env
 /plan
