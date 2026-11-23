@@ -1,0 +1,1 @@
+gigaam-mlx @ git+https://github.com/aystream/gigaam-mlx.git@20276ddd6173d636b37c6c6e13b4ee8f7b94d1ac

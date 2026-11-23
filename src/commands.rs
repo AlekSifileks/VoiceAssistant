@@ -1,4 +1,4 @@
-//! Команды по обращению «имя + пуск».
+//! Команды по имени. Слово «пуск» можно сказать, можно пропустить.
 //!
 //! Слова команд читаются из `data/assistant.db`. Модуль не слушает микрофон
 //! и не ходит в сеть. Контракт — `docs/modules/commands.md`.
@@ -75,6 +75,8 @@ enum Request {
     OpenApp { label: String, app: String },
     OpenBrowser,
     OpenBookmark(String),
+    Unclear,
+    Maybe(String),
 }
 
 #[derive(Debug)]
@@ -82,6 +84,10 @@ pub enum Outcome {
     Ignored,
     Done(String),
     Failed(String),
+    /// После «имя пуск» слово не совпало с командой. Его можно отдать модели.
+    Unparsed { rest: String },
+    /// После имени без «пуск» точной команды нет. Модель может подтвердить, иначе фраза уходит в чат.
+    Maybe { rest: String },
 }
 
 /// Создаёт базу, если её ещё нет, и один раз читает таблицу команд.
@@ -92,7 +98,7 @@ pub fn load(settings: &Settings) -> Result<Catalog, String> {
 
 pub fn is_addressed(text: &str, settings: &Settings) -> bool {
     let spoken = normalize(text);
-    after_address(&spoken, &settings.name, &settings.wake).is_some()
+    classify(&spoken, &settings.name, &settings.wake).is_some()
 }
 
 pub fn handle(text: &str, settings: &Settings, catalog: &Catalog) -> Outcome {
@@ -100,9 +106,18 @@ pub fn handle(text: &str, settings: &Settings, catalog: &Catalog) -> Outcome {
         return Outcome::Ignored;
     }
     match interpret(text, settings, catalog) {
+        Request::Unknown(rest) => Outcome::Unparsed { rest },
+        Request::Maybe(rest) => Outcome::Maybe { rest },
+        request => execute(request, settings),
+    }
+}
+
+fn execute(request: Request, settings: &Settings) -> Outcome {
+    match request {
         Request::Ignored => Outcome::Ignored,
         Request::MissingCommand => Outcome::Failed("после обращения нет команды".into()),
         Request::Unknown(command) => Outcome::Failed(format!("нет команды «{command}»")),
+        Request::Unclear | Request::Maybe(_) => Outcome::Failed("не понял".into()),
         Request::Unsupported { phrase, action } => {
             Outcome::Failed(format!("команда «{phrase}» не поддержана: {action}"))
         }
@@ -116,17 +131,386 @@ fn interpret(text: &str, settings: &Settings, catalog: &Catalog) -> Request {
     let spoken = normalize(text);
     let name = normalize(&settings.name);
     let wake = normalize(&settings.wake);
-    let Some(rest) = after_address(&spoken, &name, &wake) else {
+    let Some(address) = classify(&spoken, &name, &wake) else {
         return Request::Ignored;
     };
-    let mut words = rest.split_whitespace();
-    let Some(command) = words.next() else {
-        return Request::MissingCommand;
+    let (rest, optional) = match address {
+        Address::Wake("") => return Request::MissingCommand,
+        Address::Name("") => return Request::Ignored,
+        Address::Name(rest) if is_chat_control(rest) => return Request::Ignored,
+        Address::Wake(rest) => (rest, false),
+        Address::Name(rest) => (rest, true),
     };
+    let body = strip_leading_verb(rest);
+    if body.is_empty() {
+        return if optional {
+            Request::Ignored
+        } else {
+            Request::MissingCommand
+        };
+    }
+    if let Some(request) = exact_command(body, catalog) {
+        return request;
+    }
+    if let Ok(Some(_)) = find_bookmark(&settings.database, body) {
+        return Request::OpenBookmark(body.to_string());
+    }
+    if let Some(request) = heard_request(body, settings, catalog) {
+        return request;
+    }
+    if optional {
+        Request::Maybe(body.to_string())
+    } else {
+        Request::Unknown(body.to_string())
+    }
+}
+
+fn heard_request(body: &str, settings: &Settings, catalog: &Catalog) -> Option<Request> {
+    let (rest, saw_browser) = without_fillers(body);
+    let names = bookmark_names(&settings.database).unwrap_or_default();
+    let bookmark = nearest_sound(&rest, &names);
+    let phrases: Vec<String> = catalog.commands.iter().map(|item| item.phrase.clone()).collect();
+    let command = nearest_sound(&rest, &phrases);
+    match (bookmark, command) {
+        (Some((name, bookmark_distance)), Some((_, command_distance)))
+            if bookmark_distance < command_distance
+                || (saw_browser && bookmark_distance == command_distance) =>
+        {
+            Some(Request::OpenBookmark(name))
+        }
+        (_, Some((phrase, _))) => exact_command(&phrase, catalog),
+        (Some((name, _)), None) => Some(Request::OpenBookmark(name)),
+        (None, None) if saw_browser && rest.is_empty() => Some(Request::OpenBrowser),
+        _ => None,
+    }
+}
+
+fn without_fillers(body: &str) -> (String, bool) {
+    const FILLER: &[&str] = &[
+        "в",
+        "во",
+        "на",
+        "через",
+        "мне",
+        "пожалуйста",
+        "браузере",
+        "браузера",
+        "браузером",
+        "сайте",
+        "сайт",
+        "закладке",
+        "закладку",
+        "закладка",
+        "закладки",
+    ];
+    let mut saw_browser = false;
+    let mut words = Vec::new();
+    for word in body.split_whitespace() {
+        if FILLER.contains(&word) {
+            if word.starts_with("брауз") || word.starts_with("сайт") || word.starts_with("заклад") {
+                saw_browser = true;
+            }
+            continue;
+        }
+        words.push(word);
+    }
+    (words.join(" "), saw_browser)
+}
+
+fn nearest_sound(query: &str, names: &[String]) -> Option<(String, usize)> {
+    let wanted = sound_key(query);
+    if wanted.len() < 4 {
+        return None;
+    }
+    let mut best: Option<(String, usize)> = None;
+    for name in names {
+        let key = sound_key(name);
+        if key.len() < 4 {
+            continue;
+        }
+        let distance = edit_distance(&wanted, &key);
+        let limit = if wanted.len().min(key.len()) >= 5 { 1 } else { 0 };
+        if distance > limit {
+            continue;
+        }
+        match &best {
+            None => best = Some((name.clone(), distance)),
+            Some((_, best_distance)) if distance < *best_distance => {
+                best = Some((name.clone(), distance));
+            }
+            Some((_, best_distance)) if distance > *best_distance => {}
+            Some((best_name, _)) if sound_key(best_name) != key => return None,
+            Some(_) => {}
+        }
+    }
+    best
+}
+
+fn sound_key(text: &str) -> String {
+    let folded = latin_to_cyrillic(&normalize(text));
+    folded
+        .chars()
+        .filter(|ch| {
+            matches!(
+                ch,
+                'б' | 'в'
+                    | 'г'
+                    | 'д'
+                    | 'ж'
+                    | 'з'
+                    | 'й'
+                    | 'к'
+                    | 'л'
+                    | 'м'
+                    | 'н'
+                    | 'п'
+                    | 'р'
+                    | 'с'
+                    | 'т'
+                    | 'ф'
+                    | 'х'
+                    | 'ц'
+                    | 'ч'
+                    | 'ш'
+                    | 'щ'
+            )
+        })
+        .collect()
+}
+
+fn latin_to_cyrillic(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let rest: String = chars[index..].iter().collect();
+        let digraphs = [
+            ("sch", "щ"),
+            ("sh", "ш"),
+            ("ch", "ч"),
+            ("zh", "ж"),
+            ("ts", "ц"),
+            ("kh", "х"),
+            ("ya", "я"),
+            ("yu", "ю"),
+            ("yo", "ё"),
+        ];
+        if let Some((latin, cyrillic)) = digraphs.iter().find(|(latin, _)| rest.starts_with(latin))
+        {
+            out.push_str(cyrillic);
+            index += latin.chars().count();
+            continue;
+        }
+        let mapped = match chars[index] {
+            'a' => "а",
+            'b' => "б",
+            'c' => "к",
+            'd' => "д",
+            'e' => "е",
+            'f' => "ф",
+            'g' => "г",
+            'h' => "х",
+            'i' => "и",
+            'j' => "й",
+            'k' => "к",
+            'l' => "л",
+            'm' => "м",
+            'n' => "н",
+            'o' => "о",
+            'p' => "п",
+            'q' => "к",
+            'r' => "р",
+            's' => "с",
+            't' => "т",
+            'u' => "у",
+            'v' => "в",
+            'w' => "в",
+            'x' => "кс",
+            'y' => "и",
+            'z' => "з",
+            other => {
+                out.push(other);
+                index += 1;
+                continue;
+            }
+        };
+        out.push_str(mapped);
+        index += 1;
+    }
+    out
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for (i, left_char) in left.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right_char) in right.iter().enumerate() {
+            let cost = if left_char == right_char { 0 } else { 1 };
+            current[j + 1] = (previous[j + 1] + 1).min(current[j] + 1).min(previous[j] + cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
+fn bookmark_names(database: &Path) -> Result<Vec<String>, String> {
+    let connection = Connection::open(database).map_err(|err| err.to_string())?;
+    let mut statement = connection
+        .prepare("SELECT name FROM bookmarks")
+        .map_err(|err| err.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| err.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())
+}
+
+fn is_chat_control(rest: &str) -> bool {
+    rest == "хватит" || rest == "поболтаем" || rest.starts_with("поболтаем с ")
+}
+
+const INTENT_MIN_SCORE: f32 = 0.93;
+const INTENT_MIN_MARGIN: f32 = 0.08;
+
+pub struct Example {
+    pub phrase: String,
+    pub text: String,
+}
+
+pub struct IntentScore {
+    pub label: String,
+    pub score: f32,
+}
+
+/// Подписи, с которыми модель сравнивает хвост фразы.
+pub fn examples(catalog: &Catalog) -> Vec<Example> {
+    const EXTRA: &[(&str, &str)] = &[("курсор", "редактор")];
+    let mut out = Vec::new();
+    for command in &catalog.commands {
+        out.push(Example {
+            phrase: command.phrase.clone(),
+            text: command.phrase.clone(),
+        });
+    }
+    for (phrase, text) in EXTRA {
+        if catalog.commands.iter().any(|item| item.phrase == *phrase)
+            && !out.iter().any(|item| item.text == *text)
+        {
+            out.push(Example {
+                phrase: (*phrase).into(),
+                text: (*text).into(),
+            });
+        }
+    }
+    out
+}
+
+/// Выбирает команду по оценкам модели и выполняет её, если похожесть достаточна.
+pub fn apply_intent(
+    rest: &str,
+    settings: &Settings,
+    catalog: &Catalog,
+    scores: &[IntentScore],
+) -> Outcome {
+    match decide_intent(rest, catalog, scores) {
+        Request::Unclear
+        | Request::Unknown(_)
+        | Request::Maybe(_)
+        | Request::Ignored
+        | Request::MissingCommand => {
+            Outcome::Failed("не понял".into())
+        }
+        request => execute(request, settings),
+    }
+}
+
+fn decide_intent(rest: &str, catalog: &Catalog, scores: &[IntentScore]) -> Request {
+    let Some(phrase) = select_phrase(catalog, scores) else {
+        return Request::Unclear;
+    };
+    let Some(stored) = catalog.commands.iter().find(|item| item.phrase == phrase) else {
+        return Request::Unclear;
+    };
+    let example = scores
+        .iter()
+        .max_by(|left, right| left.score.total_cmp(&right.score))
+        .map(|item| item.label.as_str())
+        .unwrap_or("");
+    stored_request(stored, &leftover(rest, example))
+}
+
+fn select_phrase(catalog: &Catalog, scores: &[IntentScore]) -> Option<String> {
+    let examples = examples(catalog);
+    let mut best: Vec<(String, f32)> = Vec::new();
+    for score in scores {
+        let Some(example) = examples.iter().find(|item| item.text == score.label) else {
+            continue;
+        };
+        if let Some(slot) = best.iter_mut().find(|(phrase, _)| phrase == &example.phrase) {
+            slot.1 = slot.1.max(score.score);
+        } else {
+            best.push((example.phrase.clone(), score.score));
+        }
+    }
+    best.sort_by(|left, right| right.1.total_cmp(&left.1));
+    let (phrase, score) = best.first()?;
+    if *score < INTENT_MIN_SCORE {
+        return None;
+    }
+    if let Some((_, other)) = best.get(1) {
+        if score - other < INTENT_MIN_MARGIN {
+            return None;
+        }
+    }
+    Some(phrase.clone())
+}
+
+fn leftover(rest: &str, example: &str) -> String {
+    let used: std::collections::HashSet<&str> = example.split_whitespace().collect();
+    rest.split_whitespace()
+        .filter(|word| !used.contains(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn strip_leading_verb(rest: &str) -> &str {
+    const LEADING: &[&str] = &[
+        "открой",
+        "запусти",
+        "включи",
+        "покажи",
+        "открыть",
+        "запустить",
+        "включить",
+        "open",
+    ];
+    let Some(first) = rest.split_whitespace().next() else {
+        return rest;
+    };
+    if LEADING.contains(&first) {
+        rest.split_once(' ')
+            .map(|(_, tail)| tail.trim())
+            .unwrap_or("")
+    } else {
+        rest
+    }
+}
+
+fn exact_command(body: &str, catalog: &Catalog) -> Option<Request> {
+    let mut words = body.split_whitespace();
+    let command = words.next()?;
     let argument = words.collect::<Vec<_>>().join(" ");
-    let Some(stored) = catalog.commands.iter().find(|item| item.phrase == command) else {
-        return Request::Unknown(command.to_string());
-    };
+    let stored = catalog
+        .commands
+        .iter()
+        .find(|item| item.phrase == command)?;
+    Some(stored_request(stored, &argument))
+}
+
+fn stored_request(stored: &StoredCommand, argument: &str) -> Request {
     match stored.action.as_str() {
         "open_app" if stored.target.is_empty() => Request::Unsupported {
             phrase: stored.phrase.clone(),
@@ -137,7 +521,7 @@ fn interpret(text: &str, settings: &Settings, catalog: &Catalog) -> Request {
             app: stored.target.clone(),
         },
         "open_browser" if stored.takes_argument && !argument.is_empty() => {
-            Request::OpenBookmark(argument)
+            Request::OpenBookmark(argument.to_string())
         }
         "open_browser" => Request::OpenBrowser,
         _ => Request::Unsupported {
@@ -147,16 +531,33 @@ fn interpret(text: &str, settings: &Settings, catalog: &Catalog) -> Request {
     }
 }
 
-fn after_address<'a>(spoken: &'a str, name: &str, wake: &str) -> Option<&'a str> {
+enum Address<'a> {
+    Wake(&'a str),
+    Name(&'a str),
+}
+
+fn classify<'a>(spoken: &'a str, name: &str, wake: &str) -> Option<Address<'a>> {
     let wake = normalize(wake);
     name_forms(name).into_iter().find_map(|form| {
-        let prefix = format!("{form} {wake}");
-        if spoken == prefix {
-            return Some("");
+        if !wake.is_empty() {
+            let prefix = format!("{form} {wake}");
+            if spoken == prefix {
+                return Some(Address::Wake(""));
+            }
+            if let Some(rest) = spoken
+                .strip_prefix(&format!("{prefix} "))
+                .map(str::trim_start)
+            {
+                return Some(Address::Wake(rest));
+            }
+        }
+        if spoken == form {
+            return Some(Address::Name(""));
         }
         spoken
-            .strip_prefix(&format!("{prefix} "))
+            .strip_prefix(&format!("{form} "))
             .map(str::trim_start)
+            .map(Address::Name)
     })
 }
 
@@ -394,7 +795,10 @@ pub(crate) fn normalize(text: &str) -> String {
                 out.push(lower);
             }
             spaced = false;
-        } else if ch.is_whitespace() && !out.is_empty() && !spaced {
+        } else if (ch.is_whitespace() || ch == '-' || ch == '—' || ch == '–')
+            && !out.is_empty()
+            && !spaced
+        {
             out.push(' ');
             spaced = true;
         }
@@ -490,8 +894,75 @@ mod tests {
             interpret("Энни пуск курсор", &settings, &catalog),
             Request::OpenApp { app, .. } if app == "Cursor"
         ));
+        assert!(matches!(
+            interpret("Эни пуск открой курсор", &settings, &catalog),
+            Request::OpenApp { app, .. } if app == "Cursor"
+        ));
+        assert!(matches!(
+            interpret("Эни пуск запусти редактор", &settings, &catalog),
+            Request::Unknown(rest) if rest == "редактор"
+        ));
+        assert!(matches!(
+            decide_intent(
+                "редактор",
+                &catalog,
+                &[
+                    IntentScore { label: "редактор".into(), score: 1.0 },
+                    IntentScore { label: "телеграм".into(), score: 0.84 },
+                ],
+            ),
+            Request::OpenApp { app, .. } if app == "Cursor"
+        ));
+        assert!(matches!(
+            decide_intent(
+                "напиши маме",
+                &catalog,
+                &[
+                    IntentScore { label: "телеграм".into(), score: 0.71 },
+                    IntentScore { label: "курсор".into(), score: 0.67 },
+                ],
+            ),
+            Request::Unclear
+        ));
+        assert!(matches!(
+            interpret("Эни пуск открой тимбенч", &settings, &catalog),
+            Request::OpenBookmark(name) if name == "тимбенч"
+        ));
+        assert!(matches!(
+            interpret("Эни пуск-курсор.", &settings, &catalog),
+            Request::OpenApp { app, .. } if app == "Cursor"
+        ));
         assert!(is_addressed("Энни, пуск курсор", &settings));
         assert!(!is_addressed("просто речь", &settings));
+        assert!(matches!(
+            interpret("Эни открой курсор", &settings, &catalog),
+            Request::OpenApp { app, .. } if app == "Cursor"
+        ));
+        assert!(matches!(
+            interpret("Эни курсор", &settings, &catalog),
+            Request::OpenApp { app, .. } if app == "Cursor"
+        ));
+        assert!(matches!(
+            interpret("Эни поболтаем", &settings, &catalog),
+            Request::Ignored
+        ));
+        assert!(matches!(
+            interpret("Эни, хватит", &settings, &catalog),
+            Request::Ignored
+        ));
+        assert!(matches!(
+            interpret("Эни, как дела", &settings, &catalog),
+            Request::Maybe(rest) if rest == "как дела"
+        ));
+        for heard in ["team banch", "tim banch", "team bach"] {
+            assert!(
+                matches!(
+                    interpret(&format!("Эни, открой в браузере {heard}"), &settings, &catalog),
+                    Request::OpenBookmark(name) if name == "Тимбенч"
+                ),
+                "{heard}"
+            );
+        }
         let _ = std::fs::remove_file(&settings.database);
     }
 

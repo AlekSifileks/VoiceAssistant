@@ -2,7 +2,8 @@
 /captures
 /models
 /tts/.venv
-/app/Voice Assistant.app
+/stt/.venv
+/nlu/.venv
 /data
 .env
 /plan

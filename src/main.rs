@@ -1,12 +1,14 @@
 //! Приём фразы, распознавание, команды и голосовой чат.
 //!
-//! Микрофон режет речь, Whisper печатает текст. «Энни пуск …» открывает приложение.
+//! Микрофон режет речь, GigaAM печатает текст. «Энни пуск …» открывает приложение.
 //! «Энни, поболтаем» начинает разговор через OpenRouter. Модули: `docs/modules/`.
 
 mod capture;
 mod chat;
 mod commands;
+mod intent;
 mod stt;
+mod teambench;
 mod tts;
 
 use std::path::{Path, PathBuf};
@@ -49,7 +51,6 @@ fn run() -> Result<(), AppError> {
     }
 
     let commands = Settings::from_env();
-    emit(&serde_json::json!({"тип": "состояние", "значение": "загрузка"}));
     let mut catalog = if commands.enabled {
         let catalog = commands::load(&commands).map_err(AppError::Message)?;
         println!(
@@ -63,6 +64,12 @@ fn run() -> Result<(), AppError> {
         println!("команды выключены");
         commands::Catalog::empty()
     };
+    let mut desk = teambench::Desk::from_env();
+    if desk.enabled() {
+        println!("тимбенч: ключ есть, задачи и время идут через API");
+    } else {
+        println!("тимбенч: ключа нет, задачи не прочитаются");
+    }
     let chat_config = chat::Config::from_env();
     let chat_models = chat::load_models(&commands.database).map_err(AppError::Message)?;
     let default_model = chat_models
@@ -89,13 +96,33 @@ fn run() -> Result<(), AppError> {
         println!("голос чата готов");
     }
 
+    let intent_config = intent::Config::from_env();
+    println!("понимание: {}", intent_config.model);
+    println!("загружаю понимание…");
+    let started_intent = Instant::now();
+    let mut intent_model = intent::Model::start(intent_config);
+    if intent_model.ready() {
+        println!(
+            "понимание готово ({}) за {:.1} с",
+            intent_model.model_label(),
+            started_intent.elapsed().as_secs_f32()
+        );
+    } else if let Some(err) = intent_model.start_error() {
+        eprintln!("понимание: {err}");
+    }
+
+    let mut stt_config = stt::Config::from_env();
+    if let Some(model) = args.model {
+        stt_config.model = model;
+    }
+    println!("распознавание: GigaAM v3 {}", stt_config.model);
+    println!("загружаю распознавание…");
     let started = Instant::now();
-    let mut engine = Engine::load(&args.model, args.language.as_deref())?;
+    let mut engine = Engine::load(stt_config, args.language.as_deref())?;
     println!(
-        "модель {} загружена за {:.1} с, язык: {}",
-        args.model.display(),
-        started.elapsed().as_secs_f32(),
-        engine.language_label()
+        "{} загружена за {:.1} с",
+        engine.model_label(),
+        started.elapsed().as_secs_f32()
     );
 
     let mut dialogue = Dialogue::new();
@@ -106,6 +133,8 @@ fn run() -> Result<(), AppError> {
                 &text,
                 &commands,
                 &mut catalog,
+                &mut desk,
+                &mut intent_model,
                 &chat_config,
                 &chat_models,
                 &mut dialogue,
@@ -134,7 +163,6 @@ fn run() -> Result<(), AppError> {
         config.silence_ms,
         args.out.display()
     );
-    emit(&serde_json::json!({"тип": "состояние", "значение": "слушаю"}));
 
     let mut index = 0u32;
     let out_dir = args.out;
@@ -144,10 +172,7 @@ fn run() -> Result<(), AppError> {
             info.name, info.sample_rate, info.channels
         ),
         Event::Listening { rms } => println!("тишина, уровень {rms:.4}"),
-        Event::SpeechStarted => {
-            println!("слышу речь…");
-            emit(&serde_json::json!({"тип": "состояние", "значение": "речь"}));
-        }
+        Event::SpeechStarted => println!("слышу речь…"),
         Event::Phrase(phrase) => {
             index += 1;
             let path = out_dir.join(format!("phrase-{index:03}.wav"));
@@ -167,6 +192,8 @@ fn run() -> Result<(), AppError> {
                     &text,
                     &commands,
                     &mut catalog,
+                    &mut desk,
+                    &mut intent_model,
                     &chat_config,
                     &chat_models,
                     &mut dialogue,
@@ -175,11 +202,9 @@ fn run() -> Result<(), AppError> {
                 Ok(None) => {}
                 Err(err) => eprintln!("{err}"),
             }
-            emit(&serde_json::json!({"тип": "состояние", "значение": "слушаю"}));
         }
     })?;
 
-    emit(&serde_json::json!({"тип": "состояние", "значение": "остановлен"}));
     println!("остановлено");
     Ok(())
 }
@@ -189,7 +214,7 @@ struct Args {
     out: PathBuf,
     threshold: f32,
     silence_ms: u32,
-    model: PathBuf,
+    model: Option<String>,
     language: Option<String>,
     file: Option<PathBuf>,
 }
@@ -200,7 +225,7 @@ fn parse_args() -> Result<Args, String> {
         out: PathBuf::from("captures"),
         threshold: Config::default().threshold,
         silence_ms: Config::default().silence_ms,
-        model: PathBuf::from(stt::DEFAULT_MODEL),
+        model: None,
         language: None,
         file: None,
     };
@@ -234,7 +259,7 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--model" => {
-                args.model = PathBuf::from(next_value(&mut tokens, "--model")?);
+                args.model = Some(next_value(&mut tokens, "--model")?);
             }
             "--language" => {
                 args.language = Some(next_value(&mut tokens, "--language")?);
@@ -269,8 +294,8 @@ voice-assistant — слушает микрофон, печатает текст
 
   --probe           секунда с микрофона и уровень, без модели и без записи
   --file PATH       распознать готовый wav 16 кГц моно и выйти
-  --model PATH      файл ggml (по умолчанию models/ggml-large-v3-turbo.bin)
-  --language CODE   язык речи, например ru или en; по умолчанию авто
+  --model NAME      rnnt, ctc или каталог весов; по умолчанию rnnt
+  --language CODE   ru или auto; другой язык эта модель не слушает
   --out DIR         куда писать phrase-NNN.wav (по умолчанию captures)
   --threshold N     уровень, с которого кадр считается речью (по умолчанию 0.02)
   --silence-ms N    пауза, которая закрывает фразу (по умолчанию 700)"
@@ -284,7 +309,6 @@ fn recognize(engine: &mut Engine, samples: &[f32]) -> Result<Option<String>, Stt
                 transcript.elapsed.as_millis(),
                 transcript.text
             );
-            emit(&serde_json::json!({"тип": "фраза", "текст": transcript.text}));
             Ok(Some(transcript.text))
         }
         None => {
@@ -294,10 +318,93 @@ fn recognize(engine: &mut Engine, samples: &[f32]) -> Result<Option<String>, Stt
     }
 }
 
+fn understand(
+    rest: &str,
+    settings: &Settings,
+    catalog: &commands::Catalog,
+    understanding: &mut intent::Model,
+    voice: &mut tts::Speaker,
+    strict: bool,
+) -> bool {
+    let examples = commands::examples(catalog);
+    if !understanding.ready() || examples.is_empty() {
+        if strict {
+            eprintln!("команда: нет команды «{rest}»");
+            voice.acknowledge(false);
+            return true;
+        }
+        return false;
+    }
+    let labels: Vec<String> = examples.iter().map(|item| item.text.clone()).collect();
+    let guess = match understanding.guess(rest, &labels) {
+        Ok(guess) => guess,
+        Err(err) => {
+            eprintln!("понимание: {err}");
+            if strict {
+                eprintln!("команда: нет команды «{rest}»");
+                voice.acknowledge(false);
+                return true;
+            }
+            return false;
+        }
+    };
+    let scores: Vec<commands::IntentScore> = guess
+        .scores
+        .iter()
+        .map(|item| commands::IntentScore {
+            label: item.label.clone(),
+            score: item.score,
+        })
+        .collect();
+    match commands::apply_intent(rest, settings, catalog, &scores) {
+        Outcome::Done(message) => {
+            println!(
+                "понимание: «{rest}» → {} ({:.2})",
+                guess.label, guess.score
+            );
+            println!("команда: {message}");
+            voice.acknowledge(true);
+            true
+        }
+        Outcome::Failed(message) if strict || message != "не понял" => {
+            eprintln!("команда: {message}");
+            voice.acknowledge(false);
+            true
+        }
+        Outcome::Failed(_) | Outcome::Ignored | Outcome::Unparsed { .. } | Outcome::Maybe { .. } => {
+            false
+        }
+    }
+}
+
+fn teambench(desk: &mut teambench::Desk, rest: &str, voice: &mut tts::Speaker) -> bool {
+    let Some(result) = desk.perform(rest) else {
+        return false;
+    };
+    match result {
+        Ok(answer) => {
+            println!("тимбенч: {}", answer.terminal);
+            if answer.ready {
+                voice.acknowledge(true);
+            }
+            if !answer.aloud.is_empty() {
+                voice.say(&answer.aloud);
+            }
+        }
+        Err(err) => {
+            eprintln!("тимбенч: {err}");
+            voice.acknowledge(false);
+        }
+    }
+    true
+}
+
 fn dispatch(
     text: &str,
     settings: &Settings,
     catalog: &mut commands::Catalog,
+    desk: &mut teambench::Desk,
+    understanding: &mut intent::Model,
     chat_config: &chat::Config,
     models: &[chat::ChatModel],
     dialogue: &mut Dialogue,
@@ -313,15 +420,28 @@ fn dispatch(
         Outcome::Ignored => {}
         Outcome::Done(message) => {
             println!("команда: {message}");
-            emit(&serde_json::json!({"тип": "команда", "успех": true, "текст": message}));
             voice.acknowledge(true);
             return;
         }
         Outcome::Failed(message) => {
             eprintln!("команда: {message}");
-            emit(&serde_json::json!({"тип": "команда", "успех": false, "текст": message}));
             voice.acknowledge(false);
             return;
+        }
+        Outcome::Unparsed { rest } => {
+            if teambench(desk, &rest, voice) {
+                return;
+            }
+            understand(&rest, settings, catalog, understanding, voice, true);
+            return;
+        }
+        Outcome::Maybe { rest } => {
+            if teambench(desk, &rest, voice) {
+                return;
+            }
+            if understand(&rest, settings, catalog, understanding, voice, false) {
+                return;
+            }
         }
     }
     match chat::take(text, &settings.name, &settings.wake, models, dialogue) {
@@ -346,10 +466,6 @@ fn dispatch(
             }
         },
     }
-}
-
-fn emit(payload: &serde_json::Value) {
-    println!("событие {payload}");
 }
 
 fn read_wav(path: &Path) -> Result<Vec<f32>, AppError> {
