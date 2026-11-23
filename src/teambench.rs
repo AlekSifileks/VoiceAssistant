@@ -24,6 +24,7 @@ pub struct Desk {
     projects: Vec<Project>,
     projects_loaded: bool,
     last: Option<IssueRef>,
+    user_id: Option<u64>,
 }
 
 struct Project {
@@ -35,6 +36,16 @@ struct Project {
 struct IssueRef {
     id: u64,
     key: String,
+}
+
+#[derive(Clone)]
+struct Sprint {
+    id: u64,
+    name: String,
+    status: String,
+    from: String,
+    to: String,
+    project_ids: Vec<u64>,
 }
 
 struct Issue {
@@ -65,7 +76,11 @@ enum Phrase {
     Spent { task: Mention },
     Log { minutes: u32, when: When, task: Mention, comment: String },
     Comment { task: Mention, body: String },
-    Later,
+    Move { task: Mention, status: &'static str },
+    Estimate { task: Mention, minutes: u32 },
+    Create { project: String, title: String },
+    Sprint { project: String },
+    ToSprint { task: Mention },
     Reject(String),
 }
 
@@ -101,6 +116,7 @@ impl Desk {
             projects: Vec::new(),
             projects_loaded: false,
             last: None,
+            user_id: None,
         }
     }
 
@@ -119,11 +135,6 @@ impl Desk {
 
     fn perform_phrase(&mut self, phrase: Phrase) -> Result<Answer, String> {
         match phrase {
-            Phrase::Later => Ok(Answer {
-                terminal: "так ещё не умею".into(),
-                aloud: "Так ещё не умею".into(),
-                ready: false,
-            }),
             Phrase::Reject(message) => Err(message),
             Phrase::List { status } => self.list(status),
             Phrase::Backlog { project } => self.backlog(&project),
@@ -138,6 +149,11 @@ impl Desk {
                 comment,
             } => self.log(minutes, when, task, comment),
             Phrase::Comment { task, body } => self.comment(task, body),
+            Phrase::Move { task, status } => self.set_status(task, status),
+            Phrase::Estimate { task, minutes } => self.estimate(task, minutes),
+            Phrase::Create { project, title } => self.create(&project, &title),
+            Phrase::Sprint { project } => self.sprint(&project),
+            Phrase::ToSprint { task } => self.to_sprint(task),
         }
     }
 
@@ -390,6 +406,151 @@ impl Desk {
         })
     }
 
+    fn set_status(&mut self, task: Mention, status: &'static str) -> Result<Answer, String> {
+        let issue = self.resolve(task)?;
+        self.patch(
+            &format!("/issues/{}", issue.id),
+            serde_json::json!({ "status": status }),
+        )?;
+        self.remember(&issue);
+        Ok(Answer {
+            terminal: format!("{} → {}", issue.key, status_ru(status)),
+            aloud: format!("{} {}", issue.key, status_ru(status)),
+            ready: true,
+        })
+    }
+
+    fn estimate(&mut self, task: Mention, minutes: u32) -> Result<Answer, String> {
+        let issue = self.resolve(task)?;
+        self.patch(
+            &format!("/issues/{}", issue.id),
+            serde_json::json!({ "estimate_minutes": minutes }),
+        )?;
+        self.remember(&issue);
+        Ok(Answer {
+            terminal: format!("оценка {}: {}", issue.key, minutes_words(minutes)),
+            aloud: format!("Оценка {}", minutes_words(minutes)),
+            ready: true,
+        })
+    }
+
+    fn create(&mut self, project: &str, title: &str) -> Result<Answer, String> {
+        let project = self.project(project)?.clone_ref();
+        let user = self.me()?;
+        let payload = self.post(
+            &format!("/projects/{}/issues", project.id),
+            serde_json::json!({
+                "title": title,
+                "status": "backlog",
+                "priority": "medium",
+                "type": "task",
+                "assignee_id": user,
+            }),
+        )?;
+        let Some(created) = parse_issue(&unwrap_data(&payload)) else {
+            return Err("тимбенч не вернул новую задачу".into());
+        };
+        self.remember(&created);
+        Ok(Answer {
+            terminal: format!("создана {} · {}", created.key, created.title),
+            aloud: format!("Создана {}", created.key),
+            ready: true,
+        })
+    }
+
+    fn me(&mut self) -> Result<u64, String> {
+        if let Some(id) = self.user_id {
+            return Ok(id);
+        }
+        let payload = self.get("/auth/me")?;
+        let id = unwrap_data(&payload)
+            .get("id")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| "не узнал себя в тимбенче".to_string())?;
+        self.user_id = Some(id);
+        Ok(id)
+    }
+
+    fn sprint(&mut self, project: &str) -> Result<Answer, String> {
+        let filter = if project.is_empty() {
+            None
+        } else {
+            Some(self.project(project)?.clone_ref())
+        };
+        let sprint = self.active_sprint(filter.as_ref())?;
+        let ids: Vec<u64> = match filter {
+            Some(project) => vec![project.id],
+            None => sprint.project_ids.clone(),
+        };
+        if ids.is_empty() {
+            return Err(format!("не вижу проектов спринта «{}»", sprint.name));
+        }
+        let mut issues = Vec::new();
+        let mut truncated = false;
+        for id in ids {
+            let payload = self.get(&format!(
+                "/projects/{id}/issues?sprint_id={}&per_page=20&page=1",
+                sprint.id
+            ))?;
+            let batch: Vec<_> = data_array(&payload).iter().filter_map(parse_issue).collect();
+            let total = payload.get("total").and_then(|value| value.as_u64()).unwrap_or(batch.len() as u64);
+            if total > batch.len() as u64 {
+                truncated = true;
+            }
+            issues.extend(batch);
+        }
+        issues.sort_by(|left, right| left.key.cmp(&right.key));
+        if issues.len() == 1 {
+            self.remember(&issues[0]);
+        }
+        Ok(list_answer(&sprint_title(&sprint), &issues, truncated))
+    }
+
+    fn to_sprint(&mut self, task: Mention) -> Result<Answer, String> {
+        let issue = self.resolve(task)?;
+        let issue = if issue.project.is_empty() {
+            let payload = self.get(&format!("/issues/{}", issue.id))?;
+            parse_issue(&unwrap_data(&payload)).unwrap_or(issue)
+        } else {
+            issue
+        };
+        let project = self.project(&issue.project)?.clone_ref();
+        let sprint = self.active_sprint(Some(&project))?;
+        self.patch(
+            &format!("/issues/{}", issue.id),
+            serde_json::json!({ "sprint_id": sprint.id }),
+        )?;
+        self.remember(&issue);
+        Ok(Answer {
+            terminal: format!("{} → спринт «{}»", issue.key, sprint.name),
+            aloud: format!("{} в спринте «{}»", issue.key, sprint.name),
+            ready: true,
+        })
+    }
+
+    fn active_sprint(&mut self, project: Option<&Project>) -> Result<Sprint, String> {
+        let payload = self.get("/sprints")?;
+        let active: Vec<_> = data_array(&payload)
+            .iter()
+            .filter_map(sprint_of)
+            .filter(|sprint| sprint.status == "active")
+            .filter(|sprint| {
+                project.map_or(true, |project| sprint.project_ids.contains(&project.id))
+            })
+            .collect();
+        match active.len() {
+            0 => Err(match project {
+                Some(project) => format!("нет активного спринта у {}", project.name),
+                None => "нет активного спринта".into(),
+            }),
+            1 => Ok(active.into_iter().next().unwrap()),
+            _ => Err(format!(
+                "несколько активных спринтов: {}",
+                active.iter().map(|sprint| sprint.name.as_str()).collect::<Vec<_>>().join(", ")
+            )),
+        }
+    }
+
     fn resolve(&mut self, task: Mention) -> Result<Issue, String> {
         match task {
             Mention::Last => {
@@ -503,10 +664,15 @@ impl Desk {
         self.send("POST", path, Some(body))
     }
 
+    fn patch(&self, path: &str, body: Value) -> Result<Value, String> {
+        self.send("PATCH", path, Some(body))
+    }
+
     fn send(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
         let url = format!("{API}{path}");
         let request = match method {
             "POST" => self.agent.post(&url),
+            "PATCH" => self.agent.patch(&url),
             _ => self.agent.get(&url),
         };
         let request = request
@@ -655,10 +821,108 @@ fn parse(rest: &str) -> Option<Phrase> {
     if words[0] == "спиши" || words[0] == "спиши" || words[0] == "залогируй" || words[0] == "залогируй" {
         return Some(parse_log(&words[1..]));
     }
-    if words[0] == "переведи" || words[0] == "оценка" || words[0] == "оцени" || words[0] == "создай" {
-        return Some(Phrase::Later);
+    if words[0] == "переведи" || words[0] == "перенеси" {
+        return Some(parse_move(&words[1..]));
+    }
+    if words[0] == "оценка" || words[0] == "оцени" {
+        return Some(parse_estimate(&words[1..]));
+    }
+    if words[0] == "создай" || words[0] == "добавь" {
+        return Some(parse_create(&words[1..]));
+    }
+    if words.iter().any(|word| word.starts_with("спринт")) {
+        return Some(parse_sprint(&words));
     }
     None
+}
+
+fn parse_sprint(words: &[&str]) -> Phrase {
+    let after = match words.iter().position(|word| word.starts_with("спринт")) {
+        Some(index) => &words[index + 1..],
+        None => words,
+    };
+    Phrase::Sprint {
+        project: after.join(" "),
+    }
+}
+
+fn parse_move(words: &[&str]) -> Phrase {
+    for cut in 1..words.len() {
+        if matches!(&words[cut..], ["в", "спринт"] | ["в", "спринте"] | ["спринт"]) {
+            if let Some(task) = mention(&words[..cut]) {
+                return Phrase::ToSprint { task };
+            }
+        }
+    }
+    for cut in 1..words.len() {
+        let Some(status) = status_of(&words[cut..]) else {
+            continue;
+        };
+        let Some(task) = mention(&words[..cut]) else {
+            continue;
+        };
+        return Phrase::Move { task, status };
+    }
+    Phrase::Reject("не разобрал статус".into())
+}
+
+fn parse_estimate(words: &[&str]) -> Phrase {
+    for cut in 1..words.len() {
+        let tail = if words[cut] == "в" { &words[cut + 1..] } else { &words[cut..] };
+        let Some((minutes, consumed)) = take_duration(tail) else {
+            continue;
+        };
+        if consumed != tail.len() || minutes == 0 {
+            continue;
+        }
+        let Some(task) = mention(&words[..cut]) else {
+            continue;
+        };
+        return Phrase::Estimate { task, minutes };
+    }
+    Phrase::Reject("не разобрал оценку".into())
+}
+
+fn parse_create(words: &[&str]) -> Phrase {
+    let Some(start) = (match words.first() {
+        Some(&"в") | Some(&"во") => Some(1),
+        _ => None,
+    }) else {
+        return Phrase::Reject("нужен проект".into());
+    };
+    let Some(mark) = words[start..]
+        .iter()
+        .position(|word| matches!(*word, "задачу" | "задача"))
+    else {
+        return Phrase::Reject("нет названия задачи".into());
+    };
+    let project = words[start..start + mark].join(" ");
+    let title = words[start + mark + 1..].join(" ");
+    if project.is_empty() {
+        return Phrase::Reject("нужен проект".into());
+    }
+    if title.is_empty() {
+        return Phrase::Reject("нет названия задачи".into());
+    }
+    Phrase::Create { project, title }
+}
+
+fn status_of(words: &[&str]) -> Option<&'static str> {
+    Some(match words {
+        ["бэклог"] => "backlog",
+        ["к", "работе"] | ["надо", "сделать"] => "todo",
+        ["анализ"] | ["в", "анализ"] | ["на", "анализ"] => "analysis",
+        ["в", "работе"] | ["в", "работу"] | ["разработка"] | ["разработку"] | ["в", "разработку"]
+        | ["в", "разработке"] => "development",
+        ["ревью"] | ["на", "ревью"] | ["в", "ревью"] | ["на", "проверке"] | ["на", "проверку"]
+        | ["проверку"] => "review",
+        ["тест"] | ["в", "тест"] | ["на", "тест"] | ["тестирование"] | ["в", "тестирование"]
+        | ["на", "тестирование"] => "testing",
+        ["прод"] | ["в", "прод"] | ["на", "прод"] | ["проде"] | ["на", "проде"] => "production",
+        ["сделано"] | ["готово"] | ["в", "сделано"] | ["в", "готово"] => "done",
+        ["блок"] | ["в", "блок"] | ["заблокирована"] | ["заблокировано"] => "blocked",
+        _ => return None,
+    })
 }
 
 enum PhraseKind {
@@ -960,6 +1224,46 @@ fn parse_project(value: &Value) -> Option<Project> {
         key: value.get("key")?.as_str()?.to_string(),
         name: value.get("name")?.as_str()?.to_string(),
     })
+}
+
+fn sprint_of(value: &Value) -> Option<Sprint> {
+    let project_ids = match value.get("projects") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                item.get("id")
+                    .and_then(|id| id.as_u64())
+                    .or_else(|| item.as_u64())
+            })
+            .collect(),
+        _ => value
+            .get("project_ids")
+            .and_then(|ids| ids.as_array())
+            .map(|ids| ids.iter().filter_map(|id| id.as_u64()).collect())
+            .unwrap_or_default(),
+    };
+    let date = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| value.get(key).and_then(|date| date.as_str()))
+            .unwrap_or("")
+            .to_string()
+    };
+    Some(Sprint {
+        id: value.get("id")?.as_u64()?,
+        name: value.get("name").and_then(|name| name.as_str()).unwrap_or("").to_string(),
+        status: value.get("status").and_then(|status| status.as_str()).unwrap_or("").to_string(),
+        from: date(&["start_date", "from"]),
+        to: date(&["end_date", "to"]),
+        project_ids,
+    })
+}
+
+fn sprint_title(sprint: &Sprint) -> String {
+    if sprint.from.is_empty() {
+        format!("Спринт «{}»", sprint.name)
+    } else {
+        format!("Спринт «{}» {} — {}", sprint.name, sprint.from, sprint.to)
+    }
 }
 
 fn parse_issue(value: &Value) -> Option<Issue> {
@@ -1284,8 +1588,49 @@ mod tests {
             Some(Phrase::Card { task: Mention::Key { letters, number } }) if letters == "тэ бэ" && number == 62
         ));
         assert!(matches!(parse("как дела"), None));
-        assert!(matches!(parse("переведи тб 62 в тест"), Some(Phrase::Later)));
-        assert!(matches!(parse("создай в асилане задачу проверить отчёт"), Some(Phrase::Later)));
+        assert!(matches!(parse("что в спринте"), Some(Phrase::Sprint { project }) if project.is_empty()));
+        assert!(matches!(parse("что в спринте асилан"), Some(Phrase::Sprint { project }) if project == "асилан"));
+    }
+
+    #[test]
+    fn writes_find_task_and_payload() {
+        assert!(matches!(
+            parse("переведи тб 62 в тест"),
+            Some(Phrase::Move { task: Mention::Key { number: 62, .. }, status: "testing" })
+        ));
+        assert!(matches!(
+            parse("переведи её в работу"),
+            Some(Phrase::Move { task: Mention::Last, status: "development" })
+        ));
+        assert!(matches!(
+            parse("перенеси тэ бэ шестьдесят два к работе"),
+            Some(Phrase::Move { task: Mention::Key { letters, number: 62 }, status: "todo" }) if letters == "тэ бэ"
+        ));
+        assert!(matches!(parse("переведи тб 62 куда-нибудь"), Some(Phrase::Reject(_))));
+        assert!(matches!(
+            parse("оценка тб 62 два часа"),
+            Some(Phrase::Estimate { task: Mention::Key { number: 62, .. }, minutes: 120 })
+        ));
+        assert!(matches!(
+            parse("оцени неё в полтора часа"),
+            Some(Phrase::Estimate { task: Mention::Last, minutes: 90 })
+        ));
+        assert!(matches!(parse("оценка тб 62"), Some(Phrase::Reject(_))));
+        assert!(matches!(
+            parse("создай в асилане задачу проверить отчёт"),
+            Some(Phrase::Create { project, title }) if project == "асилане" && title == "проверить отчёт"
+        ));
+        assert!(matches!(parse("создай задачу проверить отчёт"), Some(Phrase::Reject(_))));
+        assert!(matches!(parse("создай в асилане задачу"), Some(Phrase::Reject(_))));
+        assert!(matches!(
+            parse("переведи тб 62 в спринт"),
+            Some(Phrase::ToSprint { task: Mention::Key { number: 62, .. } })
+        ));
+        assert!(matches!(
+            parse("перенеси её в спринт"),
+            Some(Phrase::ToSprint { task: Mention::Last })
+        ));
+        assert!(matches!(parse("переведи тб 62 в тест"), Some(Phrase::Move { status: "testing", .. })));
     }
 
     #[test]
